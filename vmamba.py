@@ -17,11 +17,13 @@
 # csm_triton.py
 ##########################################################
 
+import pathing
+
 import torch
 import warnings
 
-WITH_TRITON = True
-# WITH_TRITON = False
+# WITH_TRITON = True
+WITH_TRITON = False
 try:
     import triton
     import triton.language as tl
@@ -41,22 +43,33 @@ if WITH_TRITON:
 def cross_scan_fwd(x: torch.Tensor, in_channel_first=True, out_channel_first=True, scans=0):
     if in_channel_first:
         B, C, H, W = x.shape
-        if scans == 0:
+        # Setup scan orders
+        if scans == 10: # (forward, backward, up, down)?
             y = x.new_empty((B, 4, C, H * W))
             y[:, 0, :, :] = x.flatten(2, 3)
             y[:, 1, :, :] = x.transpose(dim0=2, dim1=3).flatten(2, 3)
             y[:, 2:4, :, :] = torch.flip(y[:, 0:2, :, :], dims=[-1])
-        elif scans == 1:
+        elif scans == 1: # (forward)
             y = x.view(B, 1, C, H * W).repeat(1, 4, 1, 1)
-        elif scans == 2:
+        elif scans == 2: # (forward, backward)
             y = x.view(B, 1, C, H * W).repeat(1, 2, 1, 1)
             y = torch.cat([y, y.flip(dims=[-1])], dim=1)
-        elif scans == 3:
+        elif scans == 3: # (forward, backward, up, down)? rotating is different?
             y = x.new_empty((B, 4, C, H * W))
             y[:, 0, :, :] = x.flatten(2, 3)
             y[:, 1, :, :] = torch.rot90(x, 1, dims=(2, 3)).flatten(2, 3)
             y[:, 2, :, :] = torch.rot90(x, 2, dims=(2, 3)).flatten(2, 3)
             y[:, 3, :, :] = torch.rot90(x, 3, dims=(2, 3)).flatten(2, 3)
+        else: # hilbert
+            
+            print('HERE')
+            y = x.new_empty((B, 4, C, H * W))
+            print(x.shape)
+            x_hilbert = pathing.space_fill(x, method='hilbert') #######################################################
+            print(x_hilbert.shape)
+            y[:, 0, :, :] = x_hilbert.flatten(2, 3)
+            y[:, 1, :, :] = x_hilbert.transpose(dim0=2, dim1=3).flatten(2, 3)
+            y[:, 2:4, :, :] = torch.flip(y[:, 0:2, :, :], dims=[-1])
     else:
         B, H, W, C = x.shape
         if scans == 0:
@@ -102,6 +115,10 @@ def cross_merge_fwd(y: torch.Tensor, in_channel_first=True, out_channel_first=Tr
             oy = oy + torch.rot90(y.view(B, K, D, H, W)[:, 2, :, :, :], -2, dims=(2, 3)).flatten(2, 3)
             oy = oy + torch.rot90(y.view(B, K, D, W, H)[:, 3, :, :, :], -3, dims=(2, 3)).flatten(2, 3)
             y = oy
+        elif scans == 4: # hilbert
+            y = y[:, 0:2] + y[:, 2:4].flip(dims=[-1]).view(B, 2, D, -1)
+            y = y[:, 0] + y[:, 1].view(B, -1, W, H).transpose(dim0=2, dim1=3).contiguous().view(B, D, -1)
+            y = pathing.space_fill(y, method='hilbert', reversed=True) ########################################################
     else:
         B, H, W, K, D = y.shape
         y = y.view(B, -1, K, D)
@@ -406,6 +423,9 @@ def triton_cross_scan_flex(
         HWRoute1 = neg_w * DH + pos_h
         HWRoute2 = neg_h * DW + neg_w
         HWRoute3 = pos_w * DH + neg_h
+    elif scans == 4:
+        # hilbert
+        raise NotImplementedError
 
     _tmp1 = DC * DH * DW
 
@@ -505,7 +525,7 @@ class CrossScanTritonF(torch.autograd.Function):
         y = x.new_empty((B, 4, C, H * W)) if out_channel_first else x.new_empty((B, H * W, 4, C))
         triton_cross_scan_flex[(NH * NW, NC, B)](
             x.contiguous(), y, 
-            (0 if in_channel_first else 1), (0 if out_channel_first else 1), 0, (0 if not one_by_one else 1), scans, 
+            (0 if in_channel_first else 1), (0 if out_channel_first else 1), 0, (0 if not one_by_one else 1), scans, ############################## HERE ###############################
             BC, BH, BW, C, H, W, NH, NW
         )
         return y
@@ -1318,12 +1338,14 @@ class SS2Dv0:
         
         B, D, H, W = x.shape
         D, N = self.A_logs.shape
-        K, D, R = self.dt_projs_weight.shape
+        K, D, R = self.dt_projs_weight.shape # change dims for more/less scans (K?) vvv
         L = H * W
 
-        x_hwwh = torch.stack([x.view(B, -1, L), torch.transpose(x, dim0=2, dim1=3).contiguous().view(B, -1, L)], dim=1).view(B, 2, -1, L)
-        xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1) # (b, k, d, l)
+        #  setup patches for each scan direction (change number of directions for more/less scans (K?)
+        x_hwwh = torch.stack([x.view(B, -1, L), torch.transpose(x, dim0=2, dim1=3).contiguous().view(B, -1, L)], dim=1).view(B, 2, -1, L) # stack patch with its mirror? and split in two
+        xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1) # (b, k, d, l) 
 
+        # get A,B,C,D,dt and discretize
         x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs, self.x_proj_weight)
         if hasattr(self, "x_proj_bias"):
             x_dbl = x_dbl + self.x_proj_bias.view(1, K, -1, 1)
@@ -1441,6 +1463,7 @@ class SS2Dv2:
             v052d=partial(self.forward_corev2, force_fp32=False, no_einsum=True, scan_mode="bidi"),
             v052dc=partial(self.forward_corev2, force_fp32=False, no_einsum=True, scan_mode="cascade2d"),
             v052d3=partial(self.forward_corev2, force_fp32=False, no_einsum=True, scan_mode=3), # debug
+            v052dh=partial(self.forward_corev2, force_fp32=False, no_einsum=True, scan_mode="hilbert"),
             # ===============================
             v2=partial(self.forward_corev2, force_fp32=(not self.disable_force32), selective_scan_backend="core"),
             v3=partial(self.forward_corev2, force_fp32=False, selective_scan_backend="oflex"),
@@ -1517,7 +1540,12 @@ class SS2Dv2:
         **kwargs,
     ):
         assert selective_scan_backend in [None, "oflex", "mamba", "torch"]
-        _scan_mode = dict(cross2d=0, unidi=1, bidi=2, cascade2d=-1).get(scan_mode, None) if isinstance(scan_mode, str) else scan_mode # for debug
+
+        ######################## !!!!!ADD SCAN MODE HERE!!!!! ###############################
+        _scan_mode = dict(cross2d=0, unidi=1, bidi=2, cascade2d=-1, hilbert=4).get(scan_mode, None) if isinstance(scan_mode, str) else scan_mode # for debug
+        ######################## !!!!!ADD SCAN MODE HERE!!!!! ###############################
+        _scan_mode = 4
+
         assert isinstance(_scan_mode, int)
         delta_softplus = True
         channel_first = self.channel_first
@@ -1533,7 +1561,7 @@ class SS2Dv2:
             return selective_scan_fn(u, delta, A, B, C, D, delta_bias, delta_softplus, ssoflex, backend=selective_scan_backend)
         
         if True:
-            xs = cross_scan_fn(x, in_channel_first=True, out_channel_first=True, scans=_scan_mode, force_torch=scan_force_torch)
+            xs = cross_scan_fn(x, in_channel_first=True, out_channel_first=True, scans=_scan_mode, force_torch=scan_force_torch) # Mod this???
             x_dbl = self.x_proj(xs.view(B, -1, L))
             dts, Bs, Cs = torch.split(x_dbl.view(B, K, -1, L), [R, N, N], dim=2)
             dts = dts.contiguous().view(B, -1, L)
@@ -2335,6 +2363,43 @@ def vmamba_base_s1l20(pretrained=False, channel_first=True, **kwargs):
         model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v2cls/vssm1_base_0229s_ckpt_epoch_225.pth"))
     return model
 
+# v052dh ######################
+@register_model
+def vmamba_tiny_hilbert(pretrained=False, channel_first=True, **kwargs):
+    model = VSSM(
+        depths=[2, 2, 8, 2], dims=96, drop_path_rate=0.2, 
+        patch_size=4, in_chans=3, num_classes=1000, 
+        ssm_d_state=1, ssm_ratio=1.0, ssm_dt_rank="auto", ssm_act_layer="silu",
+        ssm_conv=3, ssm_conv_bias=False, ssm_drop_rate=0.0, 
+        ssm_init="v0", forward_type="v052dh_noz", 
+        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
+        patch_norm=True, norm_layer=("ln2d" if channel_first else "ln"), 
+        downsample_version="v3", patchembed_version="v2", 
+        use_checkpoint=False, posembed=False, imgsize=224, 
+    )
+    if pretrained:
+        raise(NotImplementedError)
+        model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v2cls/vssm1_tiny_0230s_ckpt_epoch_264.pth"))
+    return model
+
+@register_model
+def vmamba_itty(pretrained=False, channel_first=True, **kwargs):
+    model = VSSM(
+        depths=[2, 8, 2], dims=48, drop_path_rate=0.2, 
+        patch_size=4, in_chans=3, num_classes=100, 
+        ssm_d_state=1, ssm_ratio=1.0, ssm_dt_rank="auto", ssm_act_layer="silu",
+        ssm_conv=3, ssm_conv_bias=False, ssm_drop_rate=0.0, 
+        ssm_init="v0", forward_type="v052dh_noz", 
+        mlp_ratio=2.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
+        patch_norm=True, norm_layer=("ln2d" if channel_first else "ln"), 
+        downsample_version="v3", patchembed_version="v2", 
+        use_checkpoint=False, posembed=False, imgsize=224, 
+    )
+    if pretrained:
+        raise(NotImplementedError)
+        model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v2cls/vssm1_tiny_0230s_ckpt_epoch_264.pth"))
+    return model
+###############################
 
 def get_val_loader(batch_size=64, root="./val", img_size=224, sequential=True, num_workers=0):
     from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
@@ -2463,7 +2528,7 @@ if __name__ == "__main__":
     # do_validate("vmamba_tiny_s2l5") # 82.48905065741832 95.99624022634936 0.7805328359985901
     # do_validate("vmamba_small_s2l15") # 83.64898106090746 96.59420434667109 0.7185911423439594
     # do_validate("vmamba_base_s2l15") # 83.87896726211686 96.71219726709586 0.7198247987933224
-    # do_validate("vmamba_tiny_s1l8") # 83.87896726211686 96.71219726709586 0.7198247987933224
+    do_validate("vmamba_tiny_s1l8") # 83.87896726211686 96.71219726709586 0.7198247987933224
     # do_validate("vmamba_small_s1l20") # 83.33899965941008 96.42621442606632 nan
     # do_validate("vmamba_base_s1l20") # 83.79097254317328 96.61420314781112 0.7243299191111033
     
