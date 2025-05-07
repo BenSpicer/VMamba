@@ -44,7 +44,7 @@ def cross_scan_fwd(x: torch.Tensor, in_channel_first=True, out_channel_first=Tru
     if in_channel_first:
         B, C, H, W = x.shape
         # Setup scan orders
-        if scans == 10: # (forward, backward, up, down)?
+        if scans == 0: # (forward, backward, up, down)?
             y = x.new_empty((B, 4, C, H * W))
             y[:, 0, :, :] = x.flatten(2, 3)
             y[:, 1, :, :] = x.transpose(dim0=2, dim1=3).flatten(2, 3)
@@ -60,13 +60,11 @@ def cross_scan_fwd(x: torch.Tensor, in_channel_first=True, out_channel_first=Tru
             y[:, 1, :, :] = torch.rot90(x, 1, dims=(2, 3)).flatten(2, 3)
             y[:, 2, :, :] = torch.rot90(x, 2, dims=(2, 3)).flatten(2, 3)
             y[:, 3, :, :] = torch.rot90(x, 3, dims=(2, 3)).flatten(2, 3)
-        else: # hilbert
-            
-            print('HERE')
+        elif scans == 4: # hilbert
             y = x.new_empty((B, 4, C, H * W))
-            print(x.shape)
-            x_hilbert = pathing.space_fill(x, method='hilbert') #######################################################
-            print(x_hilbert.shape)
+            # print(x.shape)
+            x_hilbert = pathing.space_fill(x) #######################################################
+            # print(x_hilbert.shape)
             y[:, 0, :, :] = x_hilbert.flatten(2, 3)
             y[:, 1, :, :] = x_hilbert.transpose(dim0=2, dim1=3).flatten(2, 3)
             y[:, 2:4, :, :] = torch.flip(y[:, 0:2, :, :], dims=[-1])
@@ -118,7 +116,9 @@ def cross_merge_fwd(y: torch.Tensor, in_channel_first=True, out_channel_first=Tr
         elif scans == 4: # hilbert
             y = y[:, 0:2] + y[:, 2:4].flip(dims=[-1]).view(B, 2, D, -1)
             y = y[:, 0] + y[:, 1].view(B, -1, W, H).transpose(dim0=2, dim1=3).contiguous().view(B, D, -1)
-            y = pathing.space_fill(y, method='hilbert', reversed=True) ########################################################
+            # print(y.shape)
+            y = y.view(B, D, H, W)
+            y = pathing.space_fill(y, reverse=True).view(B, D, -1) ########################################################
     else:
         B, H, W, K, D = y.shape
         y = y.view(B, -1, K, D)
@@ -525,7 +525,7 @@ class CrossScanTritonF(torch.autograd.Function):
         y = x.new_empty((B, 4, C, H * W)) if out_channel_first else x.new_empty((B, H * W, 4, C))
         triton_cross_scan_flex[(NH * NW, NC, B)](
             x.contiguous(), y, 
-            (0 if in_channel_first else 1), (0 if out_channel_first else 1), 0, (0 if not one_by_one else 1), scans, ############################## HERE ###############################
+            (0 if in_channel_first else 1), (0 if out_channel_first else 1), 0, (0 if not one_by_one else 1), scans, 
             BC, BH, BW, C, H, W, NH, NW
         )
         return y
@@ -1451,6 +1451,7 @@ class SS2Dv2:
         self.disable_z_act, forward_type = checkpostfix("_nozact", forward_type)
         self.out_norm, forward_type = self.get_outnorm(forward_type, self.d_inner, channel_first)
 
+        # print('type', forward_type)
         # forward_type debug =======================================
         FORWARD_TYPES = dict(
             v01=partial(self.forward_corev2, force_fp32=(not self.disable_force32), selective_scan_backend="mamba", scan_force_torch=True),
@@ -1469,6 +1470,8 @@ class SS2Dv2:
             v3=partial(self.forward_corev2, force_fp32=False, selective_scan_backend="oflex"),
         )
         self.forward_core = FORWARD_TYPES.get(forward_type, None)
+        # print('type', self.forward_core)
+
 
         # in proj =======================================
         d_proj = self.d_inner if self.disable_z else (self.d_inner * 2)
@@ -1544,7 +1547,7 @@ class SS2Dv2:
         ######################## !!!!!ADD SCAN MODE HERE!!!!! ###############################
         _scan_mode = dict(cross2d=0, unidi=1, bidi=2, cascade2d=-1, hilbert=4).get(scan_mode, None) if isinstance(scan_mode, str) else scan_mode # for debug
         ######################## !!!!!ADD SCAN MODE HERE!!!!! ###############################
-        _scan_mode = 4
+        # _scan_mode = 4
 
         assert isinstance(_scan_mode, int)
         delta_softplus = True
@@ -2365,14 +2368,14 @@ def vmamba_base_s1l20(pretrained=False, channel_first=True, **kwargs):
 
 # v052dh ######################
 @register_model
-def vmamba_tiny_hilbert(pretrained=False, channel_first=True, **kwargs):
+def vmamba_itty_hilbert(pretrained=False, channel_first=True, **kwargs):
     model = VSSM(
-        depths=[2, 2, 8, 2], dims=96, drop_path_rate=0.2, 
-        patch_size=4, in_chans=3, num_classes=1000, 
+        depths=[2, 4], dims=32, drop_path_rate=0.2, 
+        patch_size=4, in_chans=3, num_classes=200, 
         ssm_d_state=1, ssm_ratio=1.0, ssm_dt_rank="auto", ssm_act_layer="silu",
         ssm_conv=3, ssm_conv_bias=False, ssm_drop_rate=0.0, 
         ssm_init="v0", forward_type="v052dh_noz", 
-        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
+        mlp_ratio=2.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
         patch_norm=True, norm_layer=("ln2d" if channel_first else "ln"), 
         downsample_version="v3", patchembed_version="v2", 
         use_checkpoint=False, posembed=False, imgsize=224, 
@@ -2385,11 +2388,11 @@ def vmamba_tiny_hilbert(pretrained=False, channel_first=True, **kwargs):
 @register_model
 def vmamba_itty(pretrained=False, channel_first=True, **kwargs):
     model = VSSM(
-        depths=[2, 8, 2], dims=48, drop_path_rate=0.2, 
-        patch_size=4, in_chans=3, num_classes=100, 
+        depths=[2, 4], dims=32, drop_path_rate=0.2, 
+        patch_size=4, in_chans=3, num_classes=200, 
         ssm_d_state=1, ssm_ratio=1.0, ssm_dt_rank="auto", ssm_act_layer="silu",
         ssm_conv=3, ssm_conv_bias=False, ssm_drop_rate=0.0, 
-        ssm_init="v0", forward_type="v052dh_noz", 
+        ssm_init="v0", forward_type="v05_noz", 
         mlp_ratio=2.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
         patch_norm=True, norm_layer=("ln2d" if channel_first else "ln"), 
         downsample_version="v3", patchembed_version="v2", 
