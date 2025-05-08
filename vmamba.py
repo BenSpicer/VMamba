@@ -62,9 +62,7 @@ def cross_scan_fwd(x: torch.Tensor, in_channel_first=True, out_channel_first=Tru
             y[:, 3, :, :] = torch.rot90(x, 3, dims=(2, 3)).flatten(2, 3)
         elif scans == 4: # hilbert
             y = x.new_empty((B, 4, C, H * W))
-            # print(x.shape)
-            x_hilbert = pathing.space_fill(x) #######################################################
-            # print(x_hilbert.shape)
+            x_hilbert = pathing.space_fill(x)
             y[:, 0, :, :] = x_hilbert.flatten(2, 3)
             y[:, 1, :, :] = x_hilbert.transpose(dim0=2, dim1=3).flatten(2, 3)
             y[:, 2:4, :, :] = torch.flip(y[:, 0:2, :, :], dims=[-1])
@@ -116,9 +114,8 @@ def cross_merge_fwd(y: torch.Tensor, in_channel_first=True, out_channel_first=Tr
         elif scans == 4: # hilbert
             y = y[:, 0:2] + y[:, 2:4].flip(dims=[-1]).view(B, 2, D, -1)
             y = y[:, 0] + y[:, 1].view(B, -1, W, H).transpose(dim0=2, dim1=3).contiguous().view(B, D, -1)
-            # print(y.shape)
             y = y.view(B, D, H, W)
-            y = pathing.space_fill(y, reverse=True).view(B, D, -1) ########################################################
+            y = pathing.space_fill(y, reverse=True).view(B, D, -1)
     else:
         B, H, W, K, D = y.shape
         y = y.view(B, -1, K, D)
@@ -2368,39 +2365,33 @@ def vmamba_base_s1l20(pretrained=False, channel_first=True, **kwargs):
 
 # v052dh ######################
 @register_model
-def vmamba_itty_hilbert(pretrained=False, channel_first=True, **kwargs):
+def vmamba_itty_hilbert(channel_first=True, **kwargs):
     model = VSSM(
-        depths=[2, 4], dims=32, drop_path_rate=0.2, 
+        depths=[2, 2, 8, 2], dims=64, drop_path_rate=0.2, 
         patch_size=4, in_chans=3, num_classes=200, 
         ssm_d_state=1, ssm_ratio=1.0, ssm_dt_rank="auto", ssm_act_layer="silu",
         ssm_conv=3, ssm_conv_bias=False, ssm_drop_rate=0.0, 
         ssm_init="v0", forward_type="v052dh_noz", 
-        mlp_ratio=2.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
+        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
         patch_norm=True, norm_layer=("ln2d" if channel_first else "ln"), 
         downsample_version="v3", patchembed_version="v2", 
         use_checkpoint=False, posembed=False, imgsize=224, 
     )
-    if pretrained:
-        raise(NotImplementedError)
-        model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v2cls/vssm1_tiny_0230s_ckpt_epoch_264.pth"))
     return model
 
 @register_model
-def vmamba_itty(pretrained=False, channel_first=True, **kwargs):
+def vmamba_itty(channel_first=True, **kwargs):
     model = VSSM(
-        depths=[2, 4], dims=32, drop_path_rate=0.2, 
+        depths=[2, 2, 8, 2], dims=64, drop_path_rate=0.2, 
         patch_size=4, in_chans=3, num_classes=200, 
         ssm_d_state=1, ssm_ratio=1.0, ssm_dt_rank="auto", ssm_act_layer="silu",
         ssm_conv=3, ssm_conv_bias=False, ssm_drop_rate=0.0, 
         ssm_init="v0", forward_type="v05_noz", 
-        mlp_ratio=2.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
+        mlp_ratio=4.0, mlp_act_layer="gelu", mlp_drop_rate=0.0, gmlp=False,
         patch_norm=True, norm_layer=("ln2d" if channel_first else "ln"), 
         downsample_version="v3", patchembed_version="v2", 
         use_checkpoint=False, posembed=False, imgsize=224, 
     )
-    if pretrained:
-        raise(NotImplementedError)
-        model.load_state_dict(load_checkpoint("https://github.com/MzeroMiko/VMamba/releases/download/%23v2cls/vssm1_tiny_0230s_ckpt_epoch_264.pth"))
     return model
 ###############################
 
